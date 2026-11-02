@@ -1,0 +1,249 @@
+#!/bin/bash
+
+# NetworkManager helper behind the alde103.ethernet bar widget.
+#
+# Usage:
+#   ethernet state                         one line: <device>:<state>
+#   ethernet status                        key=value details of the wired device
+#   ethernet profiles                      uuid<TAB>active<TAB>method<TAB>addresses<TAB>gateway<TAB>dns<TAB>name
+#   ethernet up <uuid>                     activate a wired profile on the wired device
+#   ethernet connect                       let NetworkManager pick a profile for the cable
+#   ethernet disconnect                    take the wired device down
+#   ethernet set <uuid> auto [dns]
+#   ethernet set <uuid> manual <address[/prefix]> [gateway] [dns]
+#   ethernet new <name> auto [dns]
+#   ethernet new <name> manual <address[/prefix]> [gateway] [dns]
+#
+# Errors go to stderr as one human-readable line so the panel can show them.
+
+set -euo pipefail
+shopt -s inherit_errexit
+
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
+# With several wired NICs (laptop port + dock) prefer the one in use, then the
+# one with a cable in it.
+wired_device() {
+  local devices device
+  devices=$(nmcli -t -f DEVICE,TYPE,STATE device | awk -F: '$2 == "ethernet"')
+  [[ -n $devices ]] || return 0
+
+  device=$(grep -m1 ':connected' <<<"$devices" | cut -d: -f1 || true)
+  if [[ -z $device ]]; then
+    while IFS=: read -r name _; do
+      if [[ $(cat "/sys/class/net/$name/carrier" 2>/dev/null) == 1 ]]; then
+        device=$name
+        break
+      fi
+    done <<<"$devices"
+  fi
+
+  echo "${device:-$(head -1 <<<"$devices" | cut -d: -f1)}"
+}
+
+require_device() {
+  local device
+  device=$(wired_device)
+  [[ -n $device ]] || fail "No Ethernet device found"
+  echo "$device"
+}
+
+# NetworkManager device state codes, collapsed to what the widget cares about.
+# The kernel's carrier flag decides "no cable": NetworkManager can leave an
+# unplugged device in "disconnected" after a failed activation.
+device_state() {
+  local code
+  if [[ $(cat "/sys/class/net/$1/carrier" 2>/dev/null) != 1 ]]; then
+    echo unavailable
+    return
+  fi
+
+  code=$(nmcli -g GENERAL.STATE device show "$1" | cut -d' ' -f1)
+
+  case $code in
+  100) echo connected ;;
+  30) echo disconnected ;;
+  40 | 50 | 60 | 70 | 80 | 90) echo connecting ;;
+  110) echo disconnecting ;;
+  *) echo unavailable ;;
+  esac
+}
+
+cmd_state() {
+  local device
+  device=$(wired_device)
+  if [[ -z $device ]]; then
+    echo ":none"
+  else
+    echo "$device:$(device_state "$device")"
+  fi
+}
+
+cmd_status() {
+  local device state uuid speed
+  device=$(wired_device)
+  if [[ -z $device ]]; then
+    echo "state=none"
+    return
+  fi
+
+  state=$(device_state "$device")
+  speed=$(cat "/sys/class/net/$device/speed" 2>/dev/null || echo -1)
+
+  echo "device=$device"
+  echo "state=$state"
+  echo "mac=$(nmcli -g GENERAL.HWADDR device show "$device" | tr -d '\\')"
+  [[ $speed -gt 0 ]] && echo "speed=$speed"
+
+  [[ $state == connected || $state == connecting ]] || return 0
+
+  uuid=$(nmcli -g GENERAL.CON-UUID device show "$device")
+  echo "uuid=$uuid"
+  echo "connection=$(nmcli -g GENERAL.CONNECTION device show "$device")"
+  echo "method=$(nmcli -g ipv4.method connection show uuid "$uuid")"
+  echo "address=$(nmcli -g IP4.ADDRESS device show "$device" | sed 's/ | /, /g')"
+  echo "gateway=$(nmcli -g IP4.GATEWAY device show "$device")"
+  echo "dns=$(nmcli -g IP4.DNS device show "$device" | sed 's/ | /, /g')"
+}
+
+cmd_profiles() {
+  local -a rows args=()
+  local row uuid
+
+  mapfile -t rows < <(nmcli -t -f UUID,TYPE,ACTIVE connection show | awk -F: '$2 == "802-3-ethernet" { print $1 ":" $3 }')
+  [[ ${#rows[@]} -gt 0 ]] || return 0
+
+  declare -A active
+  for row in "${rows[@]}"; do
+    active[${row%%:*}]=${row##*:}
+    args+=(uuid "${row%%:*}")
+  done
+
+  # One nmcli call for every profile: six value lines then a blank line each.
+  nmcli -g connection.uuid,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.dns,connection.id connection show "${args[@]}" |
+    while IFS= read -r uuid; do
+      [[ -n $uuid ]] || continue
+      IFS= read -r method
+      IFS= read -r addresses
+      IFS= read -r gateway
+      IFS= read -r dns
+      IFS= read -r name
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$uuid" "${active[$uuid]:-no}" "$method" "$addresses" "$gateway" "$dns" "$name"
+    done
+}
+
+cmd_up() {
+  local uuid=${1:-} device
+  [[ -n $uuid ]] || fail "Missing profile"
+  device=$(require_device)
+  nmcli connection up uuid "$uuid" ifname "$device" >/dev/null
+}
+
+cmd_connect() {
+  nmcli device connect "$(require_device)" >/dev/null
+}
+
+cmd_disconnect() {
+  nmcli device disconnect "$(require_device)" >/dev/null
+}
+
+valid_ipv4() {
+  local ip=$1 part parts
+  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -ra parts <<<"$ip"
+  for part in "${parts[@]}"; do
+    ((10#$part <= 255)) || return 1
+  done
+}
+
+# Accepts "10.0.0.5" (assumes /24) or "10.0.0.5/16".
+normalize_address() {
+  local address=$1 ip prefix
+  ip=${address%%/*}
+  prefix=24
+  [[ $address == */* ]] && prefix=${address#*/}
+
+  valid_ipv4 "$ip" || fail "Invalid address: $address"
+  [[ $prefix =~ ^[0-9]{1,2}$ ]] && ((prefix <= 32)) || fail "Invalid prefix: /$prefix"
+  echo "$ip/$prefix"
+}
+
+# Accepts servers separated by commas and/or spaces.
+normalize_dns() {
+  local server servers=()
+  for server in ${1//,/ }; do
+    valid_ipv4 "$server" || fail "Invalid DNS server: $server"
+    servers+=("$server")
+  done
+  local IFS=,
+  echo "${servers[*]}"
+}
+
+# Fills IPV4_PROPERTIES with the nmcli property arguments for an IPv4
+# configuration. An array, not printed lines, so empty values survive.
+ipv4_properties() {
+  local method=${1:-} address gateway dns
+
+  case $method in
+  auto)
+    dns=$(normalize_dns "${2:-}")
+    IPV4_PROPERTIES=(ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns "$dns")
+    ;;
+  manual)
+    [[ -n ${2:-} ]] || fail "A static profile needs an address"
+    address=$(normalize_address "$2")
+    gateway=${3:-}
+    [[ -z $gateway ]] || valid_ipv4 "$gateway" || fail "Invalid gateway: $gateway"
+    dns=$(normalize_dns "${4:-}")
+    IPV4_PROPERTIES=(ipv4.method manual ipv4.addresses "$address" ipv4.gateway "$gateway" ipv4.dns "$dns")
+    ;;
+  *)
+    fail "Method must be auto or manual"
+    ;;
+  esac
+}
+
+cmd_set() {
+  local uuid=${1:-}
+  [[ -n $uuid ]] || fail "Missing profile"
+  shift
+
+  ipv4_properties "$@"
+  nmcli connection modify uuid "$uuid" "${IPV4_PROPERTIES[@]}"
+
+  # Re-activate so the running link picks up the change right away.
+  if nmcli -g GENERAL.STATE connection show uuid "$uuid" 2>/dev/null | grep -q activated; then
+    nmcli connection up uuid "$uuid" >/dev/null
+  fi
+}
+
+cmd_new() {
+  local name=${1:-}
+  [[ -n ${name// /} ]] || fail "The profile needs a name"
+  shift
+
+  ipv4_properties "$@"
+
+  # autoconnect off: with dozens of site profiles, a new one must never grab
+  # the cable on its own the next time it is plugged in somewhere else.
+  nmcli connection add type ethernet con-name "$name" connection.autoconnect no "${IPV4_PROPERTIES[@]}" |
+    sed -n 's/.*(\([0-9a-f-]\{36\}\)).*/\1/p'
+}
+
+command=${1:-}
+[[ $# -gt 0 ]] && shift
+
+case $command in
+state) cmd_state ;;
+status) cmd_status ;;
+profiles) cmd_profiles ;;
+up) cmd_up "$@" ;;
+connect) cmd_connect ;;
+disconnect) cmd_disconnect ;;
+set) cmd_set "$@" ;;
+new) cmd_new "$@" ;;
+*) fail "Usage: ethernet state|status|profiles|up|connect|disconnect|set|new" ;;
+esac

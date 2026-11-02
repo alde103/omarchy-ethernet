@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "alde103.ethernet",
+  "name": "Ethernet",
+  "version": "1.0.0",
+  "author": "alde103",
+  "license": "MIT",
+  "description": "Wired connection status, profile switching, and DHCP/static IPv4 editing over NetworkManager.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Ethernet",
+    "description": "Shows up while a cable is plugged in. Switch wired profiles, edit DHCP/static IPv4, or open nmtui.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showAddress": false,
+      "alwaysShow": false,
+      "refreshIntervalSec": 3
+    },
+    "schema": [
+      {
+        "key": "showAddress",
+        "type": "boolean",
+        "label": "Show IP address next to the icon",
+        "defaultValue": false
+      },
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Show even without a cable",
+        "defaultValue": false
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Cable check interval (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3
+      }
+    ]
+  }
+}
