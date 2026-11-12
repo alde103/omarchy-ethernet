@@ -4,12 +4,41 @@
 // the raw text printed by the `ethernet` helper script and returns plain data,
 // so the panel never parses nmcli output itself.
 
-// "enp4s0:connected" -> { device: "enp4s0", state: "connected" }
-function parseState(raw) {
-  var line = String(raw || "").trim()
-  var cut = line.lastIndexOf(":")
-  if (cut < 0) return { device: "", state: "none" }
-  return { device: line.slice(0, cut), state: line.slice(cut + 1) || "none" }
+// "enp4s0:connected:pci" lines -> [{ device, state, bus, label }]
+function parseDevices(raw) {
+  var devices = []
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var f = lines[i].trim().split(":")
+    if (f.length < 3 || !f[0]) continue
+    devices.push({ device: f[0], state: f[1] || "none", bus: f[2] })
+  }
+
+  // "Built-in" / "USB" reads better than enp0s20f0u1, unless two ports share a bus.
+  for (var j = 0; j < devices.length; j++) {
+    var d = devices[j]
+    var sameBus = devices.filter(function(o) { return o.bus === d.bus }).length
+    d.label = sameBus > 1 ? d.device : busLabel(d.bus, d.device)
+  }
+  return devices
+}
+
+function busLabel(bus, device) {
+  if (bus === "usb") return "USB"
+  if (bus === "pci") return "Built-in"
+  return device
+}
+
+// The port the panel opens on: the one in use, then one with a cable, then any.
+function preferredDevice(devices) {
+  for (var i = 0; i < devices.length; i++) if (devices[i].state === "connected") return devices[i].device
+  for (var j = 0; j < devices.length; j++) if (cablePresent(devices[j].state)) return devices[j].device
+  return devices.length > 0 ? devices[0].device : ""
+}
+
+function findDevice(devices, name) {
+  for (var i = 0; i < devices.length; i++) if (devices[i].device === name) return devices[i]
+  return null
 }
 
 // key=value lines -> object
@@ -25,7 +54,7 @@ function parseStatus(raw) {
   return status
 }
 
-// uuid, active, method, addresses, gateway, dns, name (tab separated)
+// uuid, device (empty while inactive), method, addresses, gateway, dns, name (tab separated)
 function parseProfiles(raw) {
   var profiles = []
   var lines = String(raw || "").split("\n")
@@ -34,7 +63,7 @@ function parseProfiles(raw) {
     if (f.length < 7 || !f[0]) continue
     profiles.push({
       uuid: f[0],
-      active: f[1] === "yes",
+      device: f[1],
       method: f[2],
       addresses: f[3],
       gateway: f[4],
@@ -42,11 +71,16 @@ function parseProfiles(raw) {
       name: f.slice(6).join("\t")
     })
   }
-  profiles.sort(function(a, b) {
-    if (a.active !== b.active) return a.active ? -1 : 1
+  return profiles
+}
+
+// The profile up on `device` first, then profiles up on other ports, then by name.
+function sortProfiles(profiles, device) {
+  function rank(p) { return p.device === device && device ? 0 : p.device ? 1 : 2 }
+  return profiles.slice().sort(function(a, b) {
+    if (rank(a) !== rank(b)) return rank(a) - rank(b)
     return a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
   })
-  return profiles
 }
 
 function filterProfiles(profiles, query) {

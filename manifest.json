@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "alde103.ethernet",
   "name": "Ethernet",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "alde103",
   "license": "MIT",
   "description": "Wired connection status, profile switching, and DHCP/static IPv4 editing over NetworkManager.",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Ethernet",
-    "description": "Shows up while a cable is plugged in. Switch wired profiles, edit DHCP/static IPv4, or open nmtui.",
+    "description": "Shows up while a cable is plugged in. Switch wired profiles per port, edit DHCP/static IPv4, or open nmtui.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",

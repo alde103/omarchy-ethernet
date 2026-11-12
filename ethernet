@@ -3,12 +3,15 @@
 # NetworkManager helper behind the alde103.ethernet bar widget.
 #
 # Usage:
-#   ethernet state                         one line: <device>:<state>
-#   ethernet status                        key=value details of the wired device
-#   ethernet profiles                      uuid<TAB>active<TAB>method<TAB>addresses<TAB>gateway<TAB>dns<TAB>name
-#   ethernet up <uuid>                     activate a wired profile on the wired device
-#   ethernet connect                       let NetworkManager pick a profile for the cable
-#   ethernet disconnect                    take the wired device down
+#   ethernet devices                       one line per wired device: <device>:<state>:<usb|pci|...>
+#   ethernet status [device]               key=value details of a wired device
+#   ethernet profiles                      uuid<TAB>device<TAB>method<TAB>addresses<TAB>gateway<TAB>dns<TAB>name
+#   ethernet up <uuid> [device]            activate a wired profile on a wired device
+#   ethernet connect [device]              let NetworkManager pick a profile for the cable
+#   ethernet disconnect [device]           take a wired device down
+#
+# Without [device], commands act on the wired device in use, else the one
+# with a cable in it.
 #   ethernet set <uuid> auto [dns]
 #   ethernet set <uuid> manual <address[/prefix]> [gateway] [dns]
 #   ethernet new <name> auto [dns]
@@ -45,9 +48,10 @@ wired_device() {
 }
 
 require_device() {
-  local device
-  device=$(wired_device)
+  local device=${1:-}
+  [[ -n $device ]] || device=$(wired_device)
   [[ -n $device ]] || fail "No Ethernet device found"
+  [[ -e /sys/class/net/$device ]] || fail "Device $device is gone"
   echo "$device"
 }
 
@@ -72,20 +76,23 @@ device_state() {
   esac
 }
 
-cmd_state() {
-  local device
-  device=$(wired_device)
-  if [[ -z $device ]]; then
-    echo ":none"
-  else
-    echo "$device:$(device_state "$device")"
-  fi
+# The bus tells the built-in port apart from a USB adapter or dock.
+device_bus() {
+  basename "$(readlink -f "/sys/class/net/$1/device/subsystem" 2>/dev/null)"
+}
+
+cmd_devices() {
+  local name
+  nmcli -t -f DEVICE,TYPE device | awk -F: '$2 == "ethernet" { print $1 }' |
+    while IFS= read -r name; do
+      echo "$name:$(device_state "$name"):$(device_bus "$name")"
+    done
 }
 
 cmd_status() {
-  local device state uuid speed
-  device=$(wired_device)
-  if [[ -z $device ]]; then
+  local device=${1:-} state uuid speed
+  [[ -n $device ]] || device=$(wired_device)
+  if [[ -z $device || ! -e /sys/class/net/$device ]]; then
     echo "state=none"
     return
   fi
@@ -113,12 +120,12 @@ cmd_profiles() {
   local -a rows args=()
   local row uuid
 
-  mapfile -t rows < <(nmcli -t -f UUID,TYPE,ACTIVE connection show | awk -F: '$2 == "802-3-ethernet" { print $1 ":" $3 }')
+  mapfile -t rows < <(nmcli -t -f UUID,TYPE,DEVICE connection show | awk -F: '$2 == "802-3-ethernet" { print $1 ":" $3 }')
   [[ ${#rows[@]} -gt 0 ]] || return 0
 
-  declare -A active
+  declare -A device_of
   for row in "${rows[@]}"; do
-    active[${row%%:*}]=${row##*:}
+    device_of[${row%%:*}]=${row#*:}
     args+=(uuid "${row%%:*}")
   done
 
@@ -131,23 +138,23 @@ cmd_profiles() {
       IFS= read -r gateway
       IFS= read -r dns
       IFS= read -r name
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$uuid" "${active[$uuid]:-no}" "$method" "$addresses" "$gateway" "$dns" "$name"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$uuid" "${device_of[$uuid]:-}" "$method" "$addresses" "$gateway" "$dns" "$name"
     done
 }
 
 cmd_up() {
   local uuid=${1:-} device
   [[ -n $uuid ]] || fail "Missing profile"
-  device=$(require_device)
+  device=$(require_device "${2:-}")
   nmcli connection up uuid "$uuid" ifname "$device" >/dev/null
 }
 
 cmd_connect() {
-  nmcli device connect "$(require_device)" >/dev/null
+  nmcli device connect "$(require_device "${1:-}")" >/dev/null
 }
 
 cmd_disconnect() {
-  nmcli device disconnect "$(require_device)" >/dev/null
+  nmcli device disconnect "$(require_device "${1:-}")" >/dev/null
 }
 
 valid_ipv4() {
@@ -237,13 +244,13 @@ command=${1:-}
 [[ $# -gt 0 ]] && shift
 
 case $command in
-state) cmd_state ;;
-status) cmd_status ;;
+devices) cmd_devices ;;
+status) cmd_status "$@" ;;
 profiles) cmd_profiles ;;
 up) cmd_up "$@" ;;
-connect) cmd_connect ;;
-disconnect) cmd_disconnect ;;
+connect) cmd_connect "$@" ;;
+disconnect) cmd_disconnect "$@" ;;
 set) cmd_set "$@" ;;
 new) cmd_new "$@" ;;
-*) fail "Usage: ethernet state|status|profiles|up|connect|disconnect|set|new" ;;
+*) fail "Usage: ethernet devices|status|profiles|up|connect|disconnect|set|new" ;;
 esac

@@ -23,11 +23,16 @@ Panel {
   readonly property bool alwaysShow: setting("alwaysShow", false) === true
   readonly property int refreshIntervalSec: Math.max(1, Number(setting("refreshIntervalSec", 3)) || 3)
 
-  property string deviceState: "none"
+  property var devices: []
+  property string chosenDevice: "" // set by the port selector; empty follows preferredDevice
+  readonly property string device: Model.findDevice(devices, chosenDevice) ? chosenDevice : Model.preferredDevice(devices)
+  readonly property string deviceState: Model.findDevice(devices, device) ? Model.findDevice(devices, device).state : "none"
   property var status: ({ state: "none" })
+  // Until statusProc catches up after a port switch, show only what `devices` knows.
+  readonly property var deviceStatus: status.device === device ? status : ({ state: deviceState, device: device })
   property var profiles: []
   property string query: ""
-  readonly property var shownProfiles: Model.filterProfiles(profiles, query)
+  readonly property var shownProfiles: Model.filterProfiles(Model.sortProfiles(profiles, device), query)
   property int profileIndex: 0
   property bool cursorActive: false
 
@@ -44,9 +49,11 @@ Panel {
   property bool closeEditorOnSuccess: false
 
   readonly property bool cablePresent: Model.cablePresent(deviceState)
-  readonly property bool shown: cablePresent || alwaysShow
   readonly property bool connected: deviceState === "connected"
-  readonly property string address: Model.primaryAddress(status.address)
+  readonly property bool anyCable: devices.some(function(d) { return Model.cablePresent(d.state) })
+  readonly property bool anyConnected: devices.some(function(d) { return d.state === "connected" })
+  readonly property bool shown: anyCable || alwaysShow
+  readonly property string address: Model.primaryAddress(deviceStatus.address)
   readonly property bool showsAddressInBar: showAddress && connected && address !== ""
   readonly property bool typing: searchField.activeFocus || nameField.activeFocus || addressField.activeFocus
     || gatewayField.activeFocus || dnsField.activeFocus
@@ -63,12 +70,27 @@ Panel {
   }
 
   function refreshState() {
-    if (!stateProc.running) stateProc.running = true
+    if (!devicesProc.running) devicesProc.running = true
+  }
+
+  function refreshStatus() {
+    if (!statusProc.running) statusProc.running = true
   }
 
   function refreshDetails() {
-    if (!statusProc.running) statusProc.running = true
+    refreshStatus()
     if (!profilesProc.running) profilesProc.running = true
+  }
+
+  function cycleDevice(delta) {
+    if (devices.length < 2) return
+    var i = devices.findIndex(function(d) { return d.device === root.device })
+    chosenDevice = devices[(i + delta + devices.length) % devices.length].device
+  }
+
+  function deviceLabel(name) {
+    var d = Model.findDevice(devices, name)
+    return d ? d.label : name
   }
 
   function runAction(args, busy) {
@@ -85,19 +107,19 @@ Panel {
       errorText = "Plug in a cable first"
       return
     }
-    runAction(["up", profile.uuid], "Connecting to " + profile.name)
+    runAction(["up", profile.uuid, device], "Connecting " + deviceLabel(device) + " to " + profile.name)
   }
 
   function toggleConnection() {
     if (!cablePresent) return
-    if (connected) runAction(["disconnect"], "Disconnecting")
-    else runAction(["connect"], "Connecting")
+    if (connected) runAction(["disconnect", device], "Disconnecting " + deviceLabel(device))
+    else runAction(["connect", device], "Connecting " + deviceLabel(device))
   }
 
   function selectedProfile() {
     if (cursorActive && profileIndex < shownProfiles.length) return shownProfiles[profileIndex]
     for (var i = 0; i < profiles.length; i++) {
-      if (profiles[i].active) return profiles[i]
+      if (profiles[i].device === device) return profiles[i]
     }
     return null
   }
@@ -176,18 +198,29 @@ Panel {
   }
 
   onDeviceStateChanged: if (opened) refreshDetails()
+  onDeviceChanged: {
+    errorText = ""
+    if (opened) refreshStatus()
+  }
   onShownProfilesChanged: if (profileIndex >= shownProfiles.length) profileIndex = Math.max(0, shownProfiles.length - 1)
 
   Process {
-    id: stateProc
-    command: [root.script, "state"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.deviceState = Model.parseState(text).state }
+    id: devicesProc
+    command: [root.script, "devices"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.devices = Model.parseDevices(text) }
   }
 
   Process {
     id: statusProc
-    command: [root.script, "status"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.status = Model.parseStatus(text) }
+    command: [root.script, "status", root.device]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.status = Model.parseStatus(text)
+        // The port changed while this ran: ask again for the new one.
+        if (root.status.device && root.status.device !== root.device) Qt.callLater(root.refreshStatus)
+      }
+    }
   }
 
   Process {
@@ -224,7 +257,7 @@ Panel {
     interval: 2000
     running: root.opened
     repeat: true
-    onTriggered: if (!statusProc.running) statusProc.running = true
+    onTriggered: root.refreshStatus()
   }
 
   BarIconButton {
@@ -233,7 +266,7 @@ Panel {
     bar: root.bar
     text: root.showsAddressInBar && !vertical ? root.address + " 󰈀" : "󰈀"
     slotSize: Style.bar.iconSlot * (root.showsAddressInBar && !vertical ? 5.5 : 1)
-    opacity: root.connected ? 1 : 0.55
+    opacity: root.anyConnected ? 1 : 0.55
     tooltipText: ""
     onPressed: function(b) {
       if (b === Qt.RightButton) root.toggleConnection()
@@ -257,7 +290,9 @@ Panel {
       blocked: root.typing
 
       onMoveRequested: function(dx, dy) {
-        if (!root.editing && dy !== 0) root.moveCursor(dy)
+        if (root.editing) return
+        if (dy !== 0) root.moveCursor(dy)
+        else if (dx !== 0) root.cycleDevice(dx)
       }
       onActivateRequested: {
         if (!root.editing && root.cursorActive) root.activate(root.shownProfiles[root.profileIndex])
@@ -281,6 +316,18 @@ Panel {
         anchors.right: parent.right
         anchors.top: parent.top
         spacing: Style.space(12)
+
+        // ---------- Port selector, only with several wired ports ----------
+        ButtonGroup {
+          visible: root.devices.length > 1
+          options: root.devices.map(function(d) { return { value: d.device, label: d.label, tooltip: d.device } })
+          value: root.device
+          focusable: false
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          onChanged: function(value) { root.chosenDevice = value }
+        }
 
         // ---------- Hero: icon · title/status · connect toggle ----------
         Item {
@@ -308,7 +355,7 @@ Panel {
             spacing: Style.space(2)
 
             Text {
-              text: root.status.connection || "Ethernet"
+              text: root.deviceStatus.connection || "Ethernet"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
@@ -319,7 +366,7 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
-              text: Model.statusLine(root.status).toUpperCase()
+              text: Model.statusLine(root.deviceStatus).toUpperCase()
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -350,11 +397,11 @@ Panel {
           width: parent.width
           spacing: Style.spacing.labelGap
 
-          InfoRow { label: "Address"; value: root.status.address || "—"; copyValue: root.address }
-          InfoRow { label: "Gateway"; value: root.status.gateway || "—"; copyValue: root.status.gateway || "" }
-          InfoRow { label: "DNS"; value: root.status.dns || "—"; copyValue: root.status.dns || "" }
-          InfoRow { label: "Method"; value: root.status.method === "manual" ? "Static" : "DHCP" }
-          InfoRow { label: "Interface"; value: (root.status.device || "") + (root.status.mac ? "  ·  " + root.status.mac : "") }
+          InfoRow { label: "Address"; value: root.deviceStatus.address || "—"; copyValue: root.address }
+          InfoRow { label: "Gateway"; value: root.deviceStatus.gateway || "—"; copyValue: root.deviceStatus.gateway || "" }
+          InfoRow { label: "DNS"; value: root.deviceStatus.dns || "—"; copyValue: root.deviceStatus.dns || "" }
+          InfoRow { label: "Method"; value: root.deviceStatus.method === "manual" ? "Static" : "DHCP" }
+          InfoRow { label: "Interface"; value: (root.deviceStatus.device || "") + (root.deviceStatus.mac ? "  ·  " + root.deviceStatus.mac : "") }
         }
 
         PanelSeparator { foreground: root.foreground }
@@ -543,7 +590,7 @@ Panel {
         Text {
           visible: !root.editing
           width: parent.width
-          text: "/ filter · ↵ connect · e edit · n new"
+          text: (root.devices.length > 1 ? "h/l port · " : "") + "/ filter · ↵ connect · e edit · n new"
             + (root.cablePresent ? " · d " + (root.connected ? "disconnect" : "connect") : "")
             + (root.connected ? " · c copy IP" : "") + " · t nmtui"
           color: root.dim
@@ -564,7 +611,7 @@ Panel {
     height: root.rowHeight
     foreground: root.foreground
     hasCursor: root.cursorActive && root.profileIndex === index
-    current: modelData.active
+    current: root.device !== "" && modelData.device === root.device
 
     MouseArea {
       anchors.fill: parent
@@ -584,7 +631,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
-        text: profileRow.modelData.active ? "󰈀" : ""
+        text: profileRow.modelData.device ? "󰈀" : ""
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -596,13 +643,15 @@ Panel {
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
-        font.bold: profileRow.modelData.active
+        font.bold: profileRow.current
         elide: Text.ElideRight
         Layout.fillWidth: true
       }
 
       Text {
+        // A profile up on the other port says which one, so ↵ here moves it on purpose.
         text: Model.methodSummary(profileRow.modelData)
+          + (profileRow.modelData.device && !profileRow.current ? " · on " + root.deviceLabel(profileRow.modelData.device) : "")
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall

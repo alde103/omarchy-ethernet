@@ -18,6 +18,9 @@ subnets, lab benches) where each network has its own saved profile.
 - Inline editor for DHCP / static IPv4 (address, gateway, DNS) on any profile,
   plus creating new profiles. New profiles have autoconnect off, so a site
   profile never grabs the cable on its own somewhere else.
+- Several wired ports (built-in + USB adapter or dock): a port selector at the
+  top of the panel picks which one you are looking at and acting on, so each
+  port can run its own profile at the same time.
 - `nmtui` one key away for everything else (routes, VLANs, 802.1X, deletes).
 
 ## Requirements
@@ -43,7 +46,8 @@ Or clone it into `~/.config/omarchy/plugins/alde103.ethernet/`, then run
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` / arrows | Move through profiles |
+| `j` / `k` / `↑` / `↓` | Move through profiles |
+| `h` / `l` / `←` / `→` | Switch wired port (with more than one) |
 | `enter` / `space` | Activate the selected profile |
 | `/` | Filter profiles (`enter` or `↓` jumps into the results) |
 | `e` | Edit the selected profile (or the active one) |
